@@ -83,6 +83,8 @@ export default function Scene({
   return (
     <>
       <color attach="background" args={['#f3cad4']} />
+      {/* Spline's "Ambient light" is not exported by SplineLoader — add it explicitly */}
+      <ambientLight intensity={0.5} color="#eaeaea" />
       <group {...props} dispose={null}>
         <primitive object={scene} onClick={handleClick} />
       </group>
