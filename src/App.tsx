@@ -30,18 +30,120 @@ const FRAME_MESH_MAP: Record<string, string> = {
   'picture-8': 'Rectangle 23',
 }
 
+type FrameDiag = {
+  splineFound: boolean
+  hasMaterial: boolean
+  layerTypes: string[]
+  threeFound: boolean
+  threeType: string
+  strategy: 'spline-texture' | 'threejs' | 'none'
+}
+
 export default function App() {
   const [selectedFrame, setSelectedFrame] = useState<string | null>(null)
   const [imageMap, setImageMap] = useState<Record<string, string>>({})
   const [inputUrl, setInputUrl] = useState('')
   const [sceneReady, setSceneReady] = useState(false)
+  const [debugInfo, setDebugInfo] = useState<{
+    sceneAvailable: boolean
+    threeSceneAvailable: boolean
+    totalSplineObjects: number
+    totalThreeObjects: number
+    frames: Record<string, FrameDiag>
+    allThreeNames: string[]
+  } | null>(null)
   const splineRef = useRef<Application | null>(null)
   const originalTexturesRef = useRef<Map<string, string | Uint8Array>>(new Map())
 
   const handleSplineLoad = useCallback((app: Application) => {
     splineRef.current = app
     // Small delay to ensure Spline's internal scene is fully populated
-    setTimeout(() => setSceneReady(true), 200)
+    setTimeout(() => {
+      // Run diagnostics
+      const diag: typeof debugInfo = {
+        sceneAvailable: true,
+        threeSceneAvailable: false,
+        totalSplineObjects: 0,
+        totalThreeObjects: 0,
+        frames: {},
+        allThreeNames: [],
+      }
+
+      // Count Spline objects
+      try {
+        const allObjects = app.getAllObjects()
+        diag.totalSplineObjects = allObjects.length
+      } catch { /* ignore */ }
+
+      // Check Three.js scene
+      const scene = (app as any)._scene as THREE.Scene | undefined
+      diag.threeSceneAvailable = !!scene
+
+      if (scene) {
+        const threeNames: string[] = []
+        let count = 0
+        scene.traverse((obj: THREE.Object3D) => {
+          count++
+          if (obj.name) threeNames.push(`${obj.name} (${obj.type})`)
+        })
+        diag.totalThreeObjects = count
+        diag.allThreeNames = threeNames
+      }
+
+      // Check each frame target
+      for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
+        const fd: FrameDiag = {
+          splineFound: false,
+          hasMaterial: false,
+          layerTypes: [],
+          threeFound: false,
+          threeType: '',
+          strategy: 'none',
+        }
+
+        // Spline API check
+        const obj = app.findObjectByName(meshName)
+        if (obj) {
+          fd.splineFound = true
+          const material = (obj as any).material
+          if (material) {
+            fd.hasMaterial = true
+            if (material.layers) {
+              fd.layerTypes = material.layers.map((l: any) => l.type)
+              if (fd.layerTypes.includes('texture')) {
+                fd.strategy = 'spline-texture'
+              }
+            }
+          }
+        }
+
+        // Three.js check
+        if (scene) {
+          let mesh: THREE.Object3D | undefined
+          // Try by name
+          mesh = scene.getObjectByName(meshName)
+          // Try UUID match
+          if (!mesh && obj) {
+            const uuid = (obj as any).uuid
+            if (uuid) {
+              scene.traverse((child: THREE.Object3D) => {
+                if (!mesh && child.uuid === uuid) mesh = child
+              })
+            }
+          }
+          if (mesh) {
+            fd.threeFound = true
+            fd.threeType = mesh.type
+            if (fd.strategy === 'none') fd.strategy = 'threejs'
+          }
+        }
+
+        diag.frames[frameName] = fd
+      }
+
+      setDebugInfo(diag)
+      setSceneReady(true)
+    }, 500)
   }, [])
 
   const handleSplineMouseDown = useCallback(
@@ -422,6 +524,54 @@ export default function App() {
         <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: 10, color: '#666', fontSize: 11, lineHeight: 1.5 }}>
           Select a picture frame (P1-P8) then paste an image URL to replace its material. Green badges = active overrides.
         </div>
+
+        {/* Diagnostics */}
+        {debugInfo && (
+          <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: 10, marginTop: 10 }}>
+            <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em', color: '#888', marginBottom: 6, fontWeight: 600 }}>
+              Scene Diagnostics
+            </div>
+            <div style={{ fontSize: 10, fontFamily: 'monospace', color: '#aaa', lineHeight: 1.6 }}>
+              <div>Spline app: <span style={{ color: '#86efac' }}>ready</span></div>
+              <div>_scene: <span style={{ color: debugInfo.threeSceneAvailable ? '#86efac' : '#fca5a5' }}>{debugInfo.threeSceneAvailable ? 'available' : 'NOT FOUND'}</span></div>
+              <div>Spline objects: {debugInfo.totalSplineObjects}</div>
+              <div>Three.js objects: {debugInfo.totalThreeObjects}</div>
+            </div>
+            <div style={{ marginTop: 8, fontSize: 10, fontFamily: 'monospace' }}>
+              <div style={{ color: '#888', marginBottom: 4 }}>Frame targets:</div>
+              {Object.entries(debugInfo.frames).map(([frame, fd]) => (
+                <div key={frame} style={{ marginBottom: 4, padding: '3px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: 4 }}>
+                  <div style={{ color: '#ccc' }}>{FRAME_MESH_MAP[frame]} ({frame})</div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ color: fd.splineFound ? '#86efac' : '#fca5a5' }}>
+                      spline:{fd.splineFound ? 'yes' : 'no'}
+                    </span>
+                    <span style={{ color: fd.hasMaterial ? '#86efac' : '#fca5a5' }}>
+                      mat:{fd.hasMaterial ? 'yes' : 'no'}
+                    </span>
+                    <span style={{ color: '#93c5fd' }}>
+                      layers:[{fd.layerTypes.join(',')}]
+                    </span>
+                    <span style={{ color: fd.threeFound ? '#86efac' : '#fca5a5' }}>
+                      three:{fd.threeFound ? fd.threeType : 'no'}
+                    </span>
+                    <span style={{ color: fd.strategy !== 'none' ? '#fbbf24' : '#fca5a5' }}>
+                      {fd.strategy}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {debugInfo.allThreeNames.length > 0 && (
+              <details style={{ marginTop: 8, fontSize: 10, fontFamily: 'monospace', color: '#666' }}>
+                <summary style={{ cursor: 'pointer', color: '#888' }}>All Three.js objects ({debugInfo.allThreeNames.length})</summary>
+                <div style={{ maxHeight: 200, overflowY: 'auto', marginTop: 4 }}>
+                  {debugInfo.allThreeNames.map((n, i) => <div key={i}>{n}</div>)}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )
