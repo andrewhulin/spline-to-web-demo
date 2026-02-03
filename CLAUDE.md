@@ -48,9 +48,13 @@ const { nodes } = useGraph(scene)
 - `useGraph` (from R3F) calls `buildGraph` which traverses the scene and creates the flat map
 
 **Camera handling:**
-Cameras inside `<primitive>` exist in the scene graph but are NOT activated by R3F as the rendering camera. An explicit `<OrthographicCamera makeDefault>` from `@react-three/drei` must be placed as a sibling:
+Cameras inside `<primitive>` exist in the scene graph but are NOT activated by R3F as the rendering camera. An explicit `<OrthographicCamera makeDefault>` from `@react-three/drei` must be placed as a sibling.
+
+**Ambient light not exported:**
+Spline's scene-level "Ambient Light" toggle is NOT included in the `.splinecode` export. Without it, surfaces facing away from the directional light receive zero illumination and blend into the background. Must be added explicitly:
 ```tsx
 <>
+  <ambientLight intensity={0.5} color="#eaeaea" />
   <group dispose={null}>
     <primitive object={scene} onClick={handleClick} />
   </group>
@@ -158,6 +162,14 @@ App.tsx (state: imageMap Record<string, string>)
 
 ### Camera
 OrthographicCamera "Camera 2": zoom=0.24, position=[-3662.89, 2379.99, 3678.25], rotation=[-0.54, -0.71, -0.37]. Creates the isometric view.
+
+## Spline Export Gaps
+
+Things the SplineLoader / `.splinecode` export does NOT include that must be added manually in R3F:
+
+1. **Ambient Light** — Spline's scene-level "Ambient" toggle is not exported. Without it, surfaces not directly lit by the directional light are black/invisible. Add `<ambientLight intensity={0.5} color="#eaeaea" />` as a sibling of the `<primitive>`.
+2. **Active Camera** — Cameras exist in the scene graph but R3F won't activate them. Use `<OrthographicCamera makeDefault>` from drei.
+3. **Shadows on Canvas** — The `<Canvas>` needs the `shadows` prop for shadow maps to render.
 
 ## Three.js Compatibility Notes
 
