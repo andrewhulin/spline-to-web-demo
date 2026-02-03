@@ -1,7 +1,11 @@
-import { Suspense, useState, useCallback } from 'react'
-import { Canvas } from '@react-three/fiber'
-import Scene from './components/Scene'
-import { useImageMaterials } from './hooks/useImageMaterial'
+import { useState, useCallback, useRef, useEffect } from 'react'
+import Spline from '@splinetool/react-spline'
+import type { SPEObject } from '@splinetool/react-spline'
+import type { Application } from '@splinetool/runtime'
+import * as THREE from 'three'
+
+const SCENE_URL =
+  'https://prod.spline.design/VqWic2mrtRRHtc62/scene.splinecode'
 
 const PICTURE_FRAMES = [
   'picture-1',
@@ -14,30 +18,97 @@ const PICTURE_FRAMES = [
   'picture-8',
 ] as const
 
-function SceneWithOverrides({
-  imageMap,
-  onMeshClick,
-}: {
-  imageMap: Record<string, string>
-  onMeshClick: (name: string) => void
-}) {
-  const materialOverrides = useImageMaterials(imageMap)
-
-  return (
-    <Scene materialOverrides={materialOverrides} onMeshClick={onMeshClick} />
-  )
+// Frame group name -> inner canvas mesh name (used for Three.js material override)
+const FRAME_MESH_MAP: Record<string, string> = {
+  'picture-1': 'Rectangle2',
+  'picture-2': 'Rectangle3',
+  'picture-3': 'Rectangle4',
+  'picture-4': 'Rectangle 41',
+  'picture-5': 'Rectangle5',
+  'picture-6': 'Rectangle6',
+  'picture-7': 'Rectangle7',
+  'picture-8': 'Rectangle 23',
 }
 
 export default function App() {
   const [selectedFrame, setSelectedFrame] = useState<string | null>(null)
   const [imageMap, setImageMap] = useState<Record<string, string>>({})
   const [inputUrl, setInputUrl] = useState('')
+  const splineRef = useRef<Application | null>(null)
+  const originalMaterialsRef = useRef<Map<string, THREE.Material>>(new Map())
 
-  const handleMeshClick = useCallback((name: string) => {
-    if (PICTURE_FRAMES.includes(name as any)) {
-      setSelectedFrame(name)
-    }
+  const handleSplineLoad = useCallback((app: Application) => {
+    splineRef.current = app
   }, [])
+
+  const handleSplineMouseDown = useCallback(
+    (e: { target: SPEObject }) => {
+      // Walk up the object name to find a picture frame
+      const name = e.target?.name
+      if (!name) return
+
+      // Check if the clicked object itself is a picture frame group
+      if (name.startsWith('picture-')) {
+        setSelectedFrame(name)
+        return
+      }
+
+      // Check if the parent frame name exists in our map
+      // SPEObject doesn't expose parent traversal, so check the mesh map
+      for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
+        if (name === meshName) {
+          setSelectedFrame(frameName)
+          return
+        }
+      }
+    },
+    []
+  )
+
+  // Apply material overrides via the Spline app's internal Three.js scene
+  useEffect(() => {
+    const app = splineRef.current
+    if (!app) return
+
+    const scene = (app as any)._scene
+    if (!scene) return
+
+    const originals = originalMaterialsRef.current
+
+    for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
+      // Find the mesh in the Three.js scene by name
+      const mesh = scene.getObjectByName(meshName) as THREE.Mesh | undefined
+      if (!mesh?.isMesh) continue
+
+      // Capture original material once
+      if (!originals.has(meshName)) {
+        originals.set(meshName, mesh.material as THREE.Material)
+      }
+
+      const imageUrl = imageMap[frameName]
+      if (imageUrl) {
+        // Load texture and create material
+        const loader = new THREE.TextureLoader()
+        loader.load(imageUrl, (texture) => {
+          texture.colorSpace = THREE.SRGBColorSpace
+          texture.needsUpdate = true
+          const mat = new THREE.MeshStandardMaterial({
+            map: texture,
+            side: THREE.FrontSide,
+            roughness: 0.5,
+            metalness: 0.0,
+          })
+          mesh.material = mat
+        })
+      } else {
+        // Restore original
+        const original = originals.get(meshName)
+        if (original) {
+          mesh.material = original
+        }
+      }
+    }
+  }, [imageMap])
 
   const handleApplyImage = () => {
     if (!selectedFrame || !inputUrl.trim()) return
@@ -69,18 +140,12 @@ export default function App() {
 
   return (
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
-      <Canvas
-        shadows
+      <Spline
+        scene={SCENE_URL}
+        onLoad={handleSplineLoad}
+        onSplineMouseDown={handleSplineMouseDown as any}
         style={{ width: '100%', height: '100%' }}
-        gl={{ antialias: true }}
-      >
-        <Suspense fallback={null}>
-          <SceneWithOverrides
-            imageMap={imageMap}
-            onMeshClick={handleMeshClick}
-          />
-        </Suspense>
-      </Canvas>
+      />
 
       {/* Debug Panel */}
       <div

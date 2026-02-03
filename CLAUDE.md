@@ -1,195 +1,154 @@
 # Spline-to-Web Demo - Project Guide
 
 ## Project Overview
-A React Three Fiber web app that renders a Spline 3D scene (isometric mini room with art) and allows dynamic modification of scene elements at runtime. Designed in Spline, controlled in code.
+A web app that renders a Spline 3D scene (isometric mini room with art) using Spline's own runtime engine and allows dynamic modification of picture frame materials at runtime. Designed in Spline, controlled in code.
 
 **Spline Scene URL:** `https://prod.spline.design/VqWic2mrtRRHtc62/scene.splinecode`
 
 ## Tech Stack
 - **Build:** Vite + React + TypeScript
-- **3D Runtime:** Three.js 0.160 via `@react-three/fiber` (R3F) + `@react-three/drei`
-- **Scene Loading:** `@splinetool/loader` (used directly via R3F's `useLoader`)
-- **Styling:** Inline styles (fullscreen canvas + overlay panel)
+- **3D Runtime:** `@splinetool/react-spline` + `@splinetool/runtime` (Spline's own engine)
+- **Material Overrides:** Three.js (accessed via Spline's internal `_scene`)
+- **Styling:** Inline styles (fullscreen Spline canvas + absolute-positioned overlay panel)
 
 ## Project Structure
 ```
 src/
-├── App.tsx                    # Canvas wrapper + HTML debug panel overlay
-├── main.tsx                   # React entry point
-├── components/
-│   └── Scene.tsx              # Spline scene via <primitive> + imperative overrides
-└── hooks/
-    └── useImageMaterial.ts    # Hook for loading image URLs as Three.js materials
+├── App.tsx       # Spline viewer + debug panel + material override logic
+└── main.tsx      # React entry point
 ```
 
 ## Architecture & Key Patterns
 
-### Spline Scene Rendering: The `<primitive>` Approach
+### Why Spline Runtime Instead of R3F Code Export
 
-**Why `<primitive>` instead of manual JSX:**
-The original approach manually wrote JSX for every mesh/group in the Spline scene (~1,377 lines). This was fragile — nodes were easily missed during conversion, causing missing elements. The `<primitive>` approach renders the entire Spline scene graph in one line, guaranteeing nothing is missing.
+Spline offers two export paths:
 
-**How it works:**
+1. **Code Export** (`@splinetool/loader` + R3F) — Exports raw Three.js geometry. The export explicitly warns: *"This export doesn't use the Spline engine. Some visual differences might be noticeable."* In practice, this caused major issues:
+   - Spline's scene-level "Ambient Light" is NOT exported, leaving surfaces unlit
+   - Materials use custom `onBeforeCompile` shader hooks that don't respond to standard Three.js lighting
+   - Adding `<ambientLight>` or converting `MeshBasicMaterial` to `MeshStandardMaterial` did not fix the rendering gaps
+   - Result: missing walls, floor, plant — anything not directly lit appeared invisible
+
+2. **Viewer/React Export** (`@splinetool/react-spline`) — Uses Spline's own rendering engine. Pixel-perfect match with the Spline editor. This is the approach we use.
+
+### Spline React Component
+
 ```tsx
-import { useLoader, useGraph } from '@react-three/fiber'
-import SplineLoader from '@splinetool/loader'
+import Spline from '@splinetool/react-spline'
+import type { Application } from '@splinetool/runtime'
 
-// useSpline from @splinetool/r3f-spline is just these two calls:
-const scene = useLoader(SplineLoader, SCENE_URL)
-const { nodes } = useGraph(scene)
-
-// Render the ENTIRE scene — all meshes, groups, lights, cameras
-<primitive object={scene} />
+<Spline
+  scene={SCENE_URL}
+  onLoad={(app: Application) => { /* store ref */ }}
+  onSplineMouseDown={(e) => { /* e.target.name */ }}
+  style={{ width: '100%', height: '100%' }}
+/>
 ```
 
-- `scene` is the raw `THREE.Scene` containing the full hierarchy from the `.splinecode` file
-- `nodes` is a flat map of `{ name: THREE.Object3D }` — live references into that scene graph
-- Mutating `nodes['Rectangle2'].material` directly changes the in-scene mesh
-- `useGraph` (from R3F) calls `buildGraph` which traverses the scene and creates the flat map
+- `onLoad` receives an `Application` instance — the Spline runtime engine
+- `onSplineMouseDown` receives events with `target: SPEObject` containing `name`, `uuid`, etc.
+- The component fills its container; wrap in a `div` with explicit dimensions
 
-**Camera handling:**
-Cameras inside `<primitive>` exist in the scene graph but are NOT activated by R3F as the rendering camera. An explicit `<OrthographicCamera makeDefault>` from `@react-three/drei` must be placed as a sibling.
+### Material Overrides via Internal Three.js Scene
 
-**Ambient light not exported:**
-Spline's scene-level "Ambient Light" toggle is NOT included in the `.splinecode` export. Without it, surfaces facing away from the directional light receive zero illumination and blend into the background. Must be added explicitly:
-```tsx
-<>
-  <ambientLight intensity={0.5} color="#eaeaea" />
-  <group dispose={null}>
-    <primitive object={scene} onClick={handleClick} />
-  </group>
-  <OrthographicCamera makeDefault zoom={0.24} ... />
-</>
-```
-
-### Dynamic Material Override System (Imperative)
-
-Since `<primitive>` renders the tree opaquely, material overrides are applied imperatively via `useEffect`:
+Spline's `Application` object has an internal `_scene` property that is a standard `THREE.Scene`. This allows Three.js-level material swaps:
 
 ```tsx
-const originalMaterialsRef = useRef<Map<string, THREE.Material>>(new Map())
+const app = splineRef.current
+const scene = (app as any)._scene
+const mesh = scene.getObjectByName(meshName) as THREE.Mesh
 
-useEffect(() => {
-  const originals = originalMaterialsRef.current
+// Store original material for later restoration
+originals.set(meshName, mesh.material)
 
-  // Capture original materials once
-  for (const meshName of Object.values(FRAME_MESH_MAP)) {
-    const node = nodes[meshName]
-    if (node?.isMesh && !originals.has(meshName)) {
-      originals.set(meshName, node.material)
-    }
-  }
-
-  // Apply overrides or restore originals
-  for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
-    const mesh = nodes[meshName]
-    if (!mesh?.isMesh) continue
-    mesh.material = materialOverrides[frameName] ?? originals.get(meshName)
-  }
-}, [materialOverrides, nodes])
+// Override with a texture-mapped material
+const loader = new THREE.TextureLoader()
+loader.load(imageUrl, (texture) => {
+  texture.colorSpace = THREE.SRGBColorSpace
+  mesh.material = new THREE.MeshStandardMaterial({
+    map: texture,
+    side: THREE.FrontSide,
+    roughness: 0.5,
+    metalness: 0.0,
+  })
+})
 ```
 
 **Key details:**
-- Original materials are stored in a `useRef<Map>` (not state — avoids re-renders)
-- Captured on first encounter before any mutations
-- When an override is removed, the original material is restored
-- Three.js picks up material changes on the next frame automatically (continuous render loop)
+- `_scene` is an undocumented internal — it works but could break in future Spline versions
+- Original materials are stored in a `useRef<Map>` to enable restoration
+- `THREE.TextureLoader` is used imperatively (no React Suspense needed)
+- `texture.colorSpace = THREE.SRGBColorSpace` is required for correct colors
+- The override `useEffect` depends on `[imageMap]` — re-runs when URLs change
 
-### Click Handling via Event Bubbling
+### Click Handling
 
-A single `onClick` on `<primitive>` handles all picture frame clicks. R3F raycasts to find the clicked mesh, then we walk up the Three.js parent chain:
+Spline's `onSplineMouseDown` provides the clicked object's name. We check against our frame map:
 
 ```tsx
-const handleClick = useCallback((e) => {
-  e.stopPropagation()
-  let current = e.object
-  while (current) {
-    if (current.name?.startsWith('picture-')) {
-      onMeshClick?.(current.name)
+const handleSplineMouseDown = (e: { target: SPEObject }) => {
+  const name = e.target?.name
+  if (name?.startsWith('picture-')) {
+    setSelectedFrame(name)
+    return
+  }
+  // Also check inner mesh names via FRAME_MESH_MAP reverse lookup
+  for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
+    if (name === meshName) {
+      setSelectedFrame(frameName)
       return
     }
-    current = current.parent
   }
-}, [onMeshClick])
+}
 ```
-
-### Image → Material Loading
-
-The `useImageMaterials` hook in `src/hooks/useImageMaterial.ts` converts image URLs to Three.js materials:
-- Uses `THREE.TextureLoader` imperatively (not drei's `useTexture`) to avoid Suspense issues with dynamic URLs
-- Sets `texture.colorSpace = THREE.SRGBColorSpace` for correct colors
-- Creates `MeshStandardMaterial` with the texture as its `map`
-- Disposes textures and materials on cleanup
 
 ### State Flow
 ```
-App.tsx (state: imageMap Record<string, string>)
-  └── SceneWithOverrides (converts URLs → materials via useImageMaterials hook)
-       └── Scene.tsx (receives Record<string, THREE.Material>, applies imperatively)
+App.tsx
+├── State: imageMap Record<string, string>  (frame name → image URL)
+├── State: selectedFrame string | null
+├── Spline component (renders scene via Spline engine)
+├── useEffect (applies material overrides via _scene when imageMap changes)
+└── Debug panel (HTML overlay for frame selection + URL input)
 ```
 
 ## Scene Element Reference
 
 ### Picture Frames (Override Targets)
-| Frame Group | Inner Canvas Mesh | Default Material | Position |
-|------------|------------------|-----------------|----------|
-| picture-1 | Rectangle2 | paper | Back wall, left |
-| picture-2 | Rectangle3 | red-6 | Back wall, center |
-| picture-3 | Rectangle4 | paper | Right wall |
-| picture-4 | Rectangle 41 | red-5 | Right wall (has shape overlays) |
-| picture-5 | Rectangle5 | paper | Back wall, small right |
-| picture-6 | Rectangle6 | paper | Right wall |
-| picture-7 | Rectangle7 | red-5 | Back wall, large left (has shapes) |
-| picture-8 | Rectangle 23 | Rectangle 23 Material | On desk |
+| Frame Group | Inner Canvas Mesh | Position |
+|------------|------------------|----------|
+| picture-1 | Rectangle2 | Back wall, left |
+| picture-2 | Rectangle3 | Back wall, center |
+| picture-3 | Rectangle4 | Right wall |
+| picture-4 | Rectangle 41 | Right wall (has shape overlays) |
+| picture-5 | Rectangle5 | Back wall, small right |
+| picture-6 | Rectangle6 | Right wall |
+| picture-7 | Rectangle7 | Back wall, large left (has shapes) |
+| picture-8 | Rectangle 23 | On desk |
 
 ### Other Key Scene Elements
-- **Walls** - Main room geometry (walls + floor, material: `Walls Material`)
-- **table** - Desk with 4 cylinder legs + rectangle top
-- **chair** - Pink stool with 4 cube legs + cylinder seat
-- **plant** - Potted plant with multiple leaf cubes
-- **carpet** - Oval rug on floor (2 ellipses)
+- **Walls** - Main room geometry (walls + floor)
+- **table** - Desk with legs + top
+- **chair** - Pink stool
+- **plant** - Potted plant with leaf cubes
+- **carpet** - Oval rug on floor
 - **window** - Back wall window with frame
-- **lamp** - Desk lamp with 5 cylinder parts
-- **artboard** - Drawing board on desk with supports
-- **artboard-2** - Easel with painting (has complex shape overlays, "画" group)
+- **lamp** - Desk lamp
+- **artboard** - Drawing board on desk
+- **artboard-2** - Easel with painting
 - **box** - Box near desk
 - **bucket** - Bucket with pencils/brushes
 - **Controls** - Color buttons: Purple, Yellow, Pink
-- **UI panels** - text-ui, picture-ui, color-ui, material-ui (floating UI elements)
+- **UI panels** - text-ui, picture-ui, color-ui, material-ui
 - **books** - book-green, book-red, book-yellow, book-blue
-- **paper** - Sheet on desk
 - **Sphere** - Decorative sphere
-
-### Camera
-OrthographicCamera "Camera 2": zoom=0.24, position=[-3662.89, 2379.99, 3678.25], rotation=[-0.54, -0.71, -0.37]. Creates the isometric view.
-
-## Spline Export Gaps
-
-Things the SplineLoader / `.splinecode` export does NOT include that must be added manually in R3F:
-
-1. **Ambient Light** — Spline's scene-level "Ambient" toggle is not exported. Without it, surfaces not directly lit by the directional light are black/invisible. Add `<ambientLight intensity={0.5} color="#eaeaea" />` as a sibling of the `<primitive>`.
-2. **Active Camera** — Cameras exist in the scene graph but R3F won't activate them. Use `<OrthographicCamera makeDefault>` from drei.
-3. **Shadows on Canvas** — The `<Canvas>` needs the `shadows` prop for shadow maps to render.
 
 ## Three.js Compatibility Notes
 
-### @splinetool/loader + Three.js Version Issues
-The `@splinetool/loader` uses deprecated Three.js APIs:
-
-1. **`mergeBufferGeometries`** → renamed to `mergeGeometries` in Three.js >= 0.156
-   - Fixed via Vite plugin in `vite.config.ts` that transforms the string at build time
-   - The plugin matches files containing `@splinetool/loader` or `SplineLoader`
-
-2. **`LinearEncoding`** → removed in Three.js >= 0.165 (approx)
-   - Fixed by using `three@0.160.0` which still has this export
-
-3. **Version constraints:**
-   - `@react-three/fiber@9.x` requires `three >= 0.156`
-   - `@react-three/drei@10.x` requires `three >= 0.159`
-   - `@splinetool/loader` needs `LinearEncoding` (removed ~0.165)
-   - **Sweet spot: `three@0.160.0`** satisfies all three
-
 ### Vite Plugin: `splineThreeCompat`
+The `@splinetool/runtime` bundles `@splinetool/loader` internally, which uses the deprecated `mergeBufferGeometries` API (renamed to `mergeGeometries` in Three.js >= 0.156). A Vite plugin in `vite.config.ts` patches this at build time:
+
 ```ts
 function splineThreeCompat(): Plugin {
   return {
@@ -206,6 +165,21 @@ function splineThreeCompat(): Plugin {
 }
 ```
 
+### Version Constraints
+- `three@0.160.0` is used because `@splinetool/loader` needs `LinearEncoding` (removed in Three.js ~0.165)
+- Three.js is still a direct dependency because we use `THREE.TextureLoader` and `THREE.MeshStandardMaterial` for material overrides
+
+## Abandoned Approaches (Lessons Learned)
+
+### R3F + `<primitive>` Approach
+Replaced 1,377 lines of manual JSX with `<primitive object={scene}>` using `@splinetool/loader` + R3F. This renders the entire scene graph in one line, but still uses Three.js rendering (not Spline's engine). The fundamental problem — Spline's custom shader materials not responding to standard Three.js lighting — remained unsolved.
+
+### Manual Ambient Light Addition
+Added `<ambientLight>` and hemisphere lights to the R3F scene. Spline's materials use `onBeforeCompile` shader hooks that bypass standard Three.js lighting calculations, so this had no visible effect.
+
+### MeshBasicMaterial → MeshStandardMaterial Conversion
+Traversed the scene to convert all `MeshBasicMaterial` to `MeshStandardMaterial`. While this makes meshes theoretically light-responsive, the converted materials lost Spline's custom shader effects, resulting in incorrect appearance.
+
 ## Commands
 - `npm run dev` - Start dev server
 - `npm run build` - TypeScript check + production build
@@ -213,11 +187,7 @@ function splineThreeCompat(): Plugin {
 
 ## Skills Reference
 The `Skills/` directory contains reference material:
-- `Skills/r3f-skills-main/skills/r3f-materials/SKILL.md` - R3F materials guide
-- `Skills/r3f-skills-main/skills/r3f-textures/SKILL.md` - R3F textures guide
-- `Skills/r3f-skills-main/skills/r3f-loaders/SKILL.md` - R3F asset loading
-- `Skills/r3f-skills-main/skills/r3f-fundamentals/SKILL.md` - R3F Canvas, hooks, setup
-- `Skills/r3f-skills-main/skills/r3f-interaction/SKILL.md` - R3F events, controls
+- `Skills/r3f-skills-main/skills/` - R3F materials, textures, loaders, fundamentals, interaction
 - `Skills/threejs-skills-main/skills/` - Raw Three.js equivalents
 - `Skills/cc-skills-main/advanced-frontend-skill/SKILL.md` - Premium UI/UX patterns
 
