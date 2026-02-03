@@ -33,6 +33,65 @@ export default function Scene({
   const { nodes } = useGraph(scene as THREE.Object3D)
 
   const originalMaterialsRef = useRef<Map<string, THREE.Material>>(new Map())
+  const patchedRef = useRef(false)
+
+  // Ensure Spline's ambient light is active and materials are lit
+  useEffect(() => {
+    if (patchedRef.current) return
+    patchedRef.current = true
+
+    const s = scene as any
+
+    // Check if Spline's built-in HemisphereLight ("Default Ambient Light") is in the scene
+    let hasAmbient = false
+    s.traverse((obj: THREE.Object3D) => {
+      if ((obj as any).isHemisphereLight || (obj as any).isAmbientLight) {
+        hasAmbient = true
+      }
+    })
+
+    // If no ambient light found, the export didn't include it — add one
+    // matching Spline's defaults: HemisphereLight(0xD3D3D3, 0x828282, 0.75)
+    if (!hasAmbient) {
+      const hemi = new THREE.HemisphereLight(0xd3d3d3, 0x828282, 0.75)
+      hemi.name = 'Default Ambient Light'
+      s.add(hemi)
+    }
+
+    // Convert MeshBasicMaterial → MeshStandardMaterial so meshes respond to lights.
+    // SplineLoader sometimes creates MeshBasicMaterial for scene geometry, which is
+    // fully unlit and ignores all light sources in the scene.
+    s.traverse((obj: THREE.Object3D) => {
+      if (!(obj as THREE.Mesh).isMesh) return
+      const mesh = obj as THREE.Mesh
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+
+      mats.forEach((mat, idx) => {
+        if (mat.type !== 'MeshBasicMaterial') return
+
+        const basic = mat as THREE.MeshBasicMaterial
+        const standard = new THREE.MeshStandardMaterial({
+          color: basic.color,
+          map: basic.map,
+          alphaMap: basic.alphaMap,
+          transparent: basic.transparent,
+          opacity: basic.opacity,
+          side: basic.side,
+          visible: basic.visible,
+          toneMapped: basic.toneMapped,
+          roughness: 0.9,
+          metalness: 0.0,
+        })
+        standard.name = basic.name
+
+        if (Array.isArray(mesh.material)) {
+          mesh.material[idx] = standard
+        } else {
+          mesh.material = standard
+        }
+      })
+    })
+  }, [scene])
 
   // Apply material overrides imperatively
   useEffect(() => {
@@ -83,7 +142,6 @@ export default function Scene({
   return (
     <>
       <color attach="background" args={['#f3cad4']} />
-      {/* Spline's "Ambient light" is not exported by SplineLoader — add it explicitly */}
       <ambientLight intensity={0.5} color="#eaeaea" />
       <group {...props} dispose={null}>
         <primitive object={scene} onClick={handleClick} />
