@@ -18,7 +18,7 @@ const PICTURE_FRAMES = [
   'picture-8',
 ] as const
 
-// Frame group name -> inner canvas mesh name (used for Three.js material override)
+// Frame group name -> inner canvas mesh name
 const FRAME_MESH_MAP: Record<string, string> = {
   'picture-1': 'Rectangle2',
   'picture-2': 'Rectangle3',
@@ -30,31 +30,132 @@ const FRAME_MESH_MAP: Record<string, string> = {
   'picture-8': 'Rectangle 23',
 }
 
+type FrameDiag = {
+  splineFound: boolean
+  hasMaterial: boolean
+  layerTypes: string[]
+  threeFound: boolean
+  threeType: string
+  strategy: 'spline-texture' | 'threejs' | 'none'
+}
+
 export default function App() {
   const [selectedFrame, setSelectedFrame] = useState<string | null>(null)
   const [imageMap, setImageMap] = useState<Record<string, string>>({})
   const [inputUrl, setInputUrl] = useState('')
+  const [sceneReady, setSceneReady] = useState(false)
+  const [debugInfo, setDebugInfo] = useState<{
+    sceneAvailable: boolean
+    threeSceneAvailable: boolean
+    totalSplineObjects: number
+    totalThreeObjects: number
+    frames: Record<string, FrameDiag>
+    allThreeNames: string[]
+  } | null>(null)
   const splineRef = useRef<Application | null>(null)
-  const originalMaterialsRef = useRef<Map<string, THREE.Material>>(new Map())
+  const originalTexturesRef = useRef<Map<string, string | Uint8Array>>(new Map())
 
   const handleSplineLoad = useCallback((app: Application) => {
     splineRef.current = app
+    // Small delay to ensure Spline's internal scene is fully populated
+    setTimeout(() => {
+      // Run diagnostics
+      const diag: typeof debugInfo = {
+        sceneAvailable: true,
+        threeSceneAvailable: false,
+        totalSplineObjects: 0,
+        totalThreeObjects: 0,
+        frames: {},
+        allThreeNames: [],
+      }
+
+      // Count Spline objects
+      try {
+        const allObjects = app.getAllObjects()
+        diag.totalSplineObjects = allObjects.length
+      } catch { /* ignore */ }
+
+      // Check Three.js scene
+      const scene = (app as any)._scene as THREE.Scene | undefined
+      diag.threeSceneAvailable = !!scene
+
+      if (scene) {
+        const threeNames: string[] = []
+        let count = 0
+        scene.traverse((obj: THREE.Object3D) => {
+          count++
+          if (obj.name) threeNames.push(`${obj.name} (${obj.type})`)
+        })
+        diag.totalThreeObjects = count
+        diag.allThreeNames = threeNames
+      }
+
+      // Check each frame target
+      for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
+        const fd: FrameDiag = {
+          splineFound: false,
+          hasMaterial: false,
+          layerTypes: [],
+          threeFound: false,
+          threeType: '',
+          strategy: 'none',
+        }
+
+        // Spline API check
+        const obj = app.findObjectByName(meshName)
+        if (obj) {
+          fd.splineFound = true
+          const material = (obj as any).material
+          if (material) {
+            fd.hasMaterial = true
+            if (material.layers) {
+              fd.layerTypes = material.layers.map((l: any) => l.type)
+              if (fd.layerTypes.includes('texture')) {
+                fd.strategy = 'spline-texture'
+              }
+            }
+          }
+        }
+
+        // Three.js check
+        if (scene) {
+          let mesh: THREE.Object3D | undefined
+          // Try by name
+          mesh = scene.getObjectByName(meshName)
+          // Try UUID match
+          if (!mesh && obj) {
+            const uuid = (obj as any).uuid
+            if (uuid) {
+              scene.traverse((child: THREE.Object3D) => {
+                if (!mesh && child.uuid === uuid) mesh = child
+              })
+            }
+          }
+          if (mesh) {
+            fd.threeFound = true
+            fd.threeType = mesh.type
+            if (fd.strategy === 'none') fd.strategy = 'threejs'
+          }
+        }
+
+        diag.frames[frameName] = fd
+      }
+
+      setDebugInfo(diag)
+      setSceneReady(true)
+    }, 500)
   }, [])
 
   const handleSplineMouseDown = useCallback(
     (e: { target: SPEObject }) => {
-      // Walk up the object name to find a picture frame
       const name = e.target?.name
       if (!name) return
 
-      // Check if the clicked object itself is a picture frame group
       if (name.startsWith('picture-')) {
         setSelectedFrame(name)
         return
       }
 
-      // Check if the parent frame name exists in our map
-      // SPEObject doesn't expose parent traversal, so check the mesh map
       for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
         if (name === meshName) {
           setSelectedFrame(frameName)
@@ -65,50 +166,122 @@ export default function App() {
     []
   )
 
-  // Apply material overrides via the Spline app's internal Three.js scene
+  // Apply material overrides via Spline's API (texture layers) with Three.js fallback
   useEffect(() => {
     const app = splineRef.current
-    if (!app) return
+    if (!app || !sceneReady) return
 
-    const scene = (app as any)._scene
-    if (!scene) return
+    const originals = originalTexturesRef.current
+    let rafId: number | null = null
+    const threejsOverrides = new Map<string, { mesh: THREE.Mesh; material: THREE.Material }>()
 
-    const originals = originalMaterialsRef.current
+    const applyOverrides = async () => {
+      for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
+        const imageUrl = imageMap[frameName]
 
-    for (const [frameName, meshName] of Object.entries(FRAME_MESH_MAP)) {
-      // Find the mesh in the Three.js scene by name
-      const mesh = scene.getObjectByName(meshName) as THREE.Mesh | undefined
-      if (!mesh?.isMesh) continue
+        // Strategy 1: Spline API — findObjectByName + texture layer updateTexture
+        const obj = app.findObjectByName(meshName)
+        if (obj) {
+          const material = (obj as any).material
+          const layers = material?.layers
+          if (layers) {
+            const textureLayer = layers.find((l: any) => l.type === 'texture')
+            if (textureLayer) {
+              // Save original texture data on first encounter
+              if (!originals.has(meshName)) {
+                try {
+                  const origData = textureLayer.texture?.image?.data
+                  if (origData) originals.set(meshName, origData)
+                } catch { /* ignore */ }
+              }
 
-      // Capture original material once
-      if (!originals.has(meshName)) {
-        originals.set(meshName, mesh.material as THREE.Material)
-      }
+              if (imageUrl) {
+                try {
+                  await textureLayer.updateTexture(imageUrl)
+                } catch (err) {
+                  console.warn(`[Override] Spline updateTexture failed for ${meshName}:`, err)
+                }
+              } else {
+                // Restore original
+                const origData = originals.get(meshName)
+                if (origData) {
+                  try { await textureLayer.updateTexture(origData) } catch { /* ignore */ }
+                }
+              }
+              continue // Done for this frame via Spline API
+            }
+          }
+        }
 
-      const imageUrl = imageMap[frameName]
-      if (imageUrl) {
-        // Load texture and create material
-        const loader = new THREE.TextureLoader()
-        loader.load(imageUrl, (texture) => {
-          texture.colorSpace = THREE.SRGBColorSpace
-          texture.needsUpdate = true
-          const mat = new THREE.MeshStandardMaterial({
-            map: texture,
-            side: THREE.FrontSide,
-            roughness: 0.5,
-            metalness: 0.0,
+        // Strategy 2: Three.js — find mesh in _scene, apply material, reapply via rAF
+        const scene = (app as any)._scene as THREE.Scene | undefined
+        if (!scene) continue
+
+        // Find mesh by name in Three.js scene
+        let mesh: THREE.Mesh | null = null
+        const byName = scene.getObjectByName(meshName)
+        if (byName && (byName as THREE.Mesh).isMesh) {
+          mesh = byName as THREE.Mesh
+        }
+
+        // Fallback: match by UUID from Spline object
+        if (!mesh && obj) {
+          const uuid = (obj as any).uuid
+          if (uuid) {
+            scene.traverse((child: THREE.Object3D) => {
+              if (!mesh && child.uuid === uuid && (child as THREE.Mesh).isMesh) {
+                mesh = child as THREE.Mesh
+              }
+            })
+          }
+        }
+
+        if (!mesh) continue
+
+        if (imageUrl) {
+          const loader = new THREE.TextureLoader()
+          loader.load(imageUrl, (texture) => {
+            texture.colorSpace = THREE.SRGBColorSpace
+            texture.needsUpdate = true
+            const mat = new THREE.MeshBasicMaterial({
+              map: texture,
+              side: THREE.DoubleSide,
+            })
+            mesh!.material = mat
+            threejsOverrides.set(meshName, { mesh: mesh!, material: mat })
           })
-          mesh.material = mat
-        })
-      } else {
-        // Restore original
-        const original = originals.get(meshName)
-        if (original) {
-          mesh.material = original
+        } else {
+          threejsOverrides.delete(meshName)
         }
       }
+
+      // Start rAF loop to keep Three.js overrides applied
+      // (Spline's engine may reset materials on its render frames)
+      if (threejsOverrides.size > 0 && rafId === null) {
+        const reapply = () => {
+          for (const { mesh, material } of threejsOverrides.values()) {
+            if (mesh.material !== material) {
+              mesh.material = material
+            }
+          }
+          rafId = requestAnimationFrame(reapply)
+        }
+        rafId = requestAnimationFrame(reapply)
+      }
     }
-  }, [imageMap])
+
+    applyOverrides()
+
+    return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId)
+      // Dispose Three.js override materials
+      for (const { material } of threejsOverrides.values()) {
+        if (material instanceof THREE.MeshBasicMaterial) material.map?.dispose()
+        material.dispose()
+      }
+      threejsOverrides.clear()
+    }
+  }, [imageMap, sceneReady])
 
   const handleApplyImage = () => {
     if (!selectedFrame || !inputUrl.trim()) return
@@ -144,6 +317,7 @@ export default function App() {
         scene={SCENE_URL}
         onLoad={handleSplineLoad}
         onSplineMouseDown={handleSplineMouseDown as any}
+        renderOnDemand={false}
         style={{ width: '100%', height: '100%' }}
       />
 
@@ -350,6 +524,54 @@ export default function App() {
         <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: 10, color: '#666', fontSize: 11, lineHeight: 1.5 }}>
           Select a picture frame (P1-P8) then paste an image URL to replace its material. Green badges = active overrides.
         </div>
+
+        {/* Diagnostics */}
+        {debugInfo && (
+          <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: 10, marginTop: 10 }}>
+            <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em', color: '#888', marginBottom: 6, fontWeight: 600 }}>
+              Scene Diagnostics
+            </div>
+            <div style={{ fontSize: 10, fontFamily: 'monospace', color: '#aaa', lineHeight: 1.6 }}>
+              <div>Spline app: <span style={{ color: '#86efac' }}>ready</span></div>
+              <div>_scene: <span style={{ color: debugInfo.threeSceneAvailable ? '#86efac' : '#fca5a5' }}>{debugInfo.threeSceneAvailable ? 'available' : 'NOT FOUND'}</span></div>
+              <div>Spline objects: {debugInfo.totalSplineObjects}</div>
+              <div>Three.js objects: {debugInfo.totalThreeObjects}</div>
+            </div>
+            <div style={{ marginTop: 8, fontSize: 10, fontFamily: 'monospace' }}>
+              <div style={{ color: '#888', marginBottom: 4 }}>Frame targets:</div>
+              {Object.entries(debugInfo.frames).map(([frame, fd]) => (
+                <div key={frame} style={{ marginBottom: 4, padding: '3px 6px', background: 'rgba(255,255,255,0.03)', borderRadius: 4 }}>
+                  <div style={{ color: '#ccc' }}>{FRAME_MESH_MAP[frame]} ({frame})</div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ color: fd.splineFound ? '#86efac' : '#fca5a5' }}>
+                      spline:{fd.splineFound ? 'yes' : 'no'}
+                    </span>
+                    <span style={{ color: fd.hasMaterial ? '#86efac' : '#fca5a5' }}>
+                      mat:{fd.hasMaterial ? 'yes' : 'no'}
+                    </span>
+                    <span style={{ color: '#93c5fd' }}>
+                      layers:[{fd.layerTypes.join(',')}]
+                    </span>
+                    <span style={{ color: fd.threeFound ? '#86efac' : '#fca5a5' }}>
+                      three:{fd.threeFound ? fd.threeType : 'no'}
+                    </span>
+                    <span style={{ color: fd.strategy !== 'none' ? '#fbbf24' : '#fca5a5' }}>
+                      {fd.strategy}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {debugInfo.allThreeNames.length > 0 && (
+              <details style={{ marginTop: 8, fontSize: 10, fontFamily: 'monospace', color: '#666' }}>
+                <summary style={{ cursor: 'pointer', color: '#888' }}>All Three.js objects ({debugInfo.allThreeNames.length})</summary>
+                <div style={{ maxHeight: 200, overflowY: 'auto', marginTop: 4 }}>
+                  {debugInfo.allThreeNames.map((n, i) => <div key={i}>{n}</div>)}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )
